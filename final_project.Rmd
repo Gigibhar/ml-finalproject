@@ -1,0 +1,280 @@
+---
+title: 'Final Project'
+author: Sophia Chkonia (sc4934), Vasuda Kapoor (vk2480), Girisha Bharadwaj (gb2762), Sneha Mehta (sm5134)
+date: 5/2/2023
+output: word_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lattice)
+library(caret)
+library(randomForest)
+library(kernlab)
+library(devtools)
+library(ggbiplot)
+library(stats)
+library(factoextra)
+library(cluster)
+library(Matrix)
+library(ROSE)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("C:/Columbia/Machine Learning/")
+```
+
+
+```{r, load and clean data, warning=FALSE}
+# Load data
+load("exposome.RData")
+
+#Merge all data frames into a single data frame. 
+studydata = merge(exposome,phenotype,by="ID") %>% merge(covariates, by="ID")
+
+#Strip off ID Variable
+studydata$ID = NULL
+
+# Find exposure variables relevant to research question
+chem_vars = codebook %>%
+  filter(domain == "Chemicals" & period == "Pregnancy") %>%
+  dplyr::select(variable_name)
+
+chem_list = rownames(chem_vars)
+
+# Find outcome variable relevant to research question --> e3_bw
+final_vars = c(chem_list, "e3_bw")
+
+# Create new data frame with only relevant variables
+final_df = studydata[, final_vars] %>% 
+  mutate(bw_bin = ifelse(e3_bw<=2500, "Low", "Normal")) %>% 
+  mutate(bw_bin = as.factor(bw_bin)) %>% 
+  dplyr::select(-e3_bw, -hs_cotinine_mcat_None, -hs_tl_mdich_None)
+
+# Partition data 
+set.seed(123)
+train.indices = createDataPartition(y = final_df$bw_bin,p = 0.7,list = FALSE)
+train.data = final_df[train.indices, ]
+test.data = final_df[-train.indices, ]
+```
+
+## Introduction
+This analysis seeks to predict birthweight of newborns based upon maternal exposure to chemicals during pregnancy. Chemical exposure is ubiquitous in modern life and many chemicals have individually had demonstrated effects on birthweight (Padula et al., 2020). The `exposome` dataset presents an opportunity to analyze the impact of a broad range of different chemicals and understand which types can be the most influential in predicting birthweight. Some of the chemical exposures in the `exposome` dataset include a broad range of metals, organochlorines, and organophosphate pesticides such as DMT, of which previous studies have suggested the association to low birthweight (Guo et al., 2014).
+
+The ability to predict low-birthweight basen on exposures to a range of chemicals could inform public health interventions by identifying high-risk environments for low-birth weight births, enabling a more effective the allocation of resources to prioritize birthing people at highest risk.
+
+We utilized three machine learning techniques to identify the chemical exposures most influential on low-birth weight: elastic net, principal component analysis (PCA), and random forest. All features were selected from the `chemical` domain of the dataset, and all chemical measurements were taken during pregnancy. We defined “Low” birthweight as 2500g or less (Jin, 2015). As non-numeric variables cannot be analyzed through PCA, we also removed `tobacco smoke` and `thallium` (measured dichotomously) from our analysis.
+
+We chose elastic net because it is a useful method of feature selection for regression models (logistic regression in this case). As compared to ridge regression and LASSO, it balances between regularization and feature selection allowing for reduction of model features without overfitting the data.
+
+Random forest was added to identify which of the features in the dataset were most influential on low-birthweight. Additionally, random forest can accommodate nonlinear interactions and is easy to interpret. 
+
+PCA was used since it can help identify important patterns and relationships between exposure data and health outcomes by reducing the dimensionality of this large dataset, while still retaining the most important information.
+
+## Elastic Net
+
+```{r, warning=FALSE}
+set.seed(123)
+summary(final_df$bw_bin) # data is imbalanced
+
+# upsample data
+train.control<-trainControl(method="cv", number=10, sampling="up")
+
+en.model<- train(
+  bw_bin ~., 
+  data = train.data, 
+  method = "glmnet",
+  trControl = train.control, preProc=c("center", "scale"),
+ tuneLength=10
+  )
+#Print the values of alpha and lambda that gave best prediction
+en.model$bestTune # downsampling model 48, alpha = 0.6, lambda = 0.010724; upsampling model 14, alpha = 0.2, lambda = 0.00200
+
+#Print all of the options examined
+en.model$results # downsampling accuracy = 0.5119077, upsampling accuracy = 0.6928614
+
+# Model coefficients
+coef(en.model$finalModel, en.model$bestTune$lambda)
+
+# Make predictions in test set
+en.pred <- en.model %>% predict(test.data)
+
+# Model prediction performance
+postResample(en.pred,test.data$bw_bin) # accuracy = 0.629820051
+```
+
+We chose an elastic net algorithm because it can be an effective way to perform variable selection on regression models. As the outcome data is imbalanced, the models were run with both upsampling and downsampling methods. Upsampling provided better results so those are reported here. With upsampling, the best tuned model returned an $\alpha$ = 0.2 and $\lambda$ = 0.00200. The accuracy of the model on the training data was 69.28%. All features were selected in the final model. The accuracy of the model on the test data is 62.98% indicating that the model was not overfit. However, the accuracy of the model is not very high, indicating that it may not be the best model to predict this outcome.
+
+## Principal Component Analysis
+```{r scale, warning=FALSE}
+# removing outcome variable for PCA analysis
+final_df_pca = final_df %>%
+  select(-bw_bin)
+
+# Calculate the correlation matrix for our data
+cor_matrix <- cor(final_df_pca)
+
+# Check if the correlation matrix is nearly singular
+is_singular <- nearPD(cor_matrix)$rank < ncol(cor_matrix)
+# since is_singular = 0, we calculate the eigenvalues
+eigenvalues <- eigen(cor_matrix)$values
+
+# Plot the eigenvalues to assess variation
+plot(eigenvalues, type = "b", xlab = "Component", ylab = "Eigenvalue")
+
+# Since the first few eigenvalues are larger than the rest, it is appropriate for us to use PCA for this data
+
+#Obtain and compare means and standard deviations across features. na.rm removes the missings
+colMeans(final_df_pca, na.rm = TRUE) 
+apply(final_df_pca, 2, sd, na.rm = TRUE)
+
+# There is some difference in means and mitoses is different than others. So decided to center and scale.
+```
+
+```{r pca, warning=FALSE}
+# The function prcomp() will center and scale the variables and then identify the principal components
+bc.pca<-prcomp( ~., data=final_df_pca, center=TRUE, scale=TRUE, na.action=na.omit)
+
+#Can compare sds used to scale with the sds above to ensure they are close.
+bc.pca$scale
+
+#Generates scree plot
+fviz_eig(bc.pca)
+
+#view results of pca. Note the first three components are needed to explain at least 75% of the variance
+summary(bc.pca)
+
+#Identify how features loaded on the different components
+bc.pca$rotation
+
+ggbiplot(bc.pca)
+
+ggbiplot(bc.pca, choices = c(1,2))
+ggbiplot(bc.pca, choices = c(2,3))
+
+# The first three principal components, therefore, explain 29% of the variance, which does not seem to be significant.
+
+# We can still create new variable using PCA. 
+
+# Extract the first three principal components
+pc1 <- bc.pca$x[, 1]
+pc2 <- bc.pca$x[, 2]
+pc3 <- bc.pca$x[, 3]
+
+# Calculate the new variable as a weighted sum of the three principal components 
+
+#To assign weightage to each component, we use the variance percentage to calculate proportions: 
+
+#15.87159 + 6.8721521 + 6.2481285 = 28.99187
+
+#Component 1: 15.87159 / 28.99187 = 0.5479 or approximately 0.55
+#Component 2: 6.8721521 / 28.99187 = 0.2372 or approximately 0.24
+#Component 3: 6.2481285 / 28.99187 = 0.2149 or approximately 0.21
+
+new_var <- (0.55 * pc1) + (0.24 * pc2) + (0.21 * pc3)
+new_var = unname(new_var)
+
+# Add the new variable to the original dataset
+new_data <- final_df_pca %>% 
+  mutate(new_var = new_var)
+
+# Interpret the new variable in terms of its input features by looking at loadings
+loadings <- bc.pca$rotation[, 1:3]
+view(loadings)
+```
+
+To determine if PCA was an appropriate algorithm for our data with a binary outcome, we plotted the eigen values to assess for variation. Since the first few eigenvalues were larger than the rest, we thought it would be appropriate for us to use PCA for this data. 
+
+The PCA results showed that the first three principal components only explained about 30% of the variance, which does not seem to be significant. However, we still proceeded to create a new variable using the first three principal components that could potentially account for 30% of the data. This new variable is a weighted sum of the first three principal components, where the weight is assigned based on variance percentage proportions. 
+
+The loadings indicate the contribution of each input feature to each principal component and we can use this information to interpret the new variable created using the first three principal components. The new variable is heavily weighted towards the first principal component, and the loadings for PC1 are extremely small for all input features, which indicates that this principal component is not capturing much of the variation in the input features. Thus, the new variable is not informative, which is to be expected given our previous results.
+
+## Random Forest
+
+```{r, warning=FALSE}
+# Random Forest
+set.seed(123)
+
+### Model 1: 3 values of mtry. 100 trees. 
+control.settings<-trainControl(method="cv", number=10)
+mtry.vals<-c(ncol(train.data)-1, sqrt(ncol(train.data)-1), 0.5*ncol(train.data)-1)
+mtry.grid<-expand.grid(.mtry=round(mtry.vals))
+
+rf.bwt.1<-train(bw_bin ~., data=train.data, method="rf", metric="Accuracy", tuneGrid=mtry.grid, trControl=control.settings, ntree=100)
+
+confusionMatrix(rf.bwt.1)
+rf.bwt.1$results
+rf.bwt.1$bestTune
+rf.bwt.1$finalModel
+
+varImp(rf.bwt.1)
+
+varImpPlot(rf.bwt.1$finalModel, main = "RF Model 1 Variables",cex = 0.6)
+
+# high accuracy, but 0.0 low weight births are predicted correct.
+
+### Model 2: 200 trees
+
+rf.bwt.2<-train(bw_bin ~., data=train.data, method="rf", metric="Accuracy", tuneGrid=mtry.grid, trControl=control.settings, ntree=200)
+confusionMatrix(rf.bwt.2)
+rf.bwt.2$results
+rf.bwt.2$bestTune
+rf.bwt.2$finalModel
+
+# not a significant difference in accuracy, will retain 100 trees
+
+
+# Model 3: tune additional mtry values
+control <- trainControl(method = "cv", number = 5, search = "grid")
+
+# Define the hyperparameter grid for tuning
+grid <- expand.grid(.mtry = seq(7, 64, by = 2))
+
+# Train the random forest model on the training data
+set.seed(123)
+rf.bwt.3 <- train(bw_bin ~., data = train.data, method = "rf", metric = "Accuracy", trControl = control, tuneGrid = grid)
+
+
+confusionMatrix(rf.bwt.3)
+rf.bwt.3$results
+rf.bwt.3$bestTune
+rf.bwt.3$finalModel
+
+### Model 4: Downsampling the "normal" weight class
+train.data.balanced <- ovun.sample(bw_bin ~., data=train.data, method="under")$data
+rf.bwt.4 <- train(bw_bin ~., data=train.data.balanced, method="rf", metric="Accuracy", tuneGrid=mtry.grid, trControl=control.settings, ntree=100)
+
+confusionMatrix(rf.bwt.4)
+rf.bwt.4$results
+rf.bwt.4$bestTune
+rf.bwt.4$finalModel
+
+varImp(rf.bwt.4)
+varImpPlot(rf.bwt.4$finalModel, main = "RF Model 4 Variables",cex = 0.6)
+
+```
+
+Before tuning, the model has a high accuracy rate (96.27%), but due to class imbalance (not enough low birthweight class),it did not predict any "Low" instances correctly. After increasing the number of trees to 200, the accuracy rate decreased slightly but there was no drastic variation (stable accuracy), therefore, 100 trees were kept. In Model 3, we expanded the mtry grid search and best tune still remained mtry 7, there was still a very low prediction rate for low birthweight class. Due to this reason, in Model 4, we downsampled the majority class (normal birthweight) and kept the original mtry grid (best tune = 7) with 100 trees. After downsampling the majority class ("Normal" birthweight), the model correctly classified 22.8% of the "Normal" instances (True Negative Rate) and misclassified 27.8% of the "Low" instances as "Normal" (False Negative Rate). The model falsely predicted 29.1% of the "Normal" instances as "Low" (False Positive Rate) and correctly predicted 20.3% of the "Low" instances (True Positive Rate). The accuracy of the model is reported as 0.4304 or 43.04%. In conclusion, the random forest model is not the best model for this analysis, as it seems to not be able to correctly predict the "Low" birthweight class, most likely due to class imbalance in the outcome variable. 
+
+## Conclusion
+
+The elastic net model identified PCB 153, OHMiNP (Phthalate), PCB 118, and MiBP (Phthalate) as the largest coefficients in the model (have the most influence on the outcome). Because the measurements in the dataset are log-transformed, for every one unit increase in log exposure to PCB 118, the odds of a low birthweight increase by 62%. For every one unit increase in log exposure to MiPB, the odds of a low birthweight increase by 63%. PCB 153 and OHMiNP are considered to be protective in this model. For every one unit increase in log exposure to PCB 153, the odds of low birthweight decreases by 57%, and for every one unit increase in log exposure to OHMiNP, the odds of low birthweight decrease by 40%. All odds ratios are adjusted for all other exposures in the model.
+
+In our random forest model, oxybenzone is the most important feature, with the highest mean decrease Gini coefficient of 100.00, followed by Monoethyl phthalate (MEP) with a coefficient of 93.01. The features Ethyl paraben (ETPA) and Caesium (Cs) have lower coefficients of 49.96 and 46.01, respectively, indicating that they contribute less to the model's predictive performance compared to the first two features.
+
+The random forest model had an error rate of 4.17%, and misclassified all low samples as normal. Downsampling of the normal weight class was attempted, which decreased the accuracy and increased the error rate to 47.44%. Overall, the random forest model critically misclassifies all low birthweight samples as normal, indicative of the bias towards the normal weight class. A model that could better handle the unbalanced weight classes would be more appropriate. Comparatively, the elastic net model performed slightly better with an accuracy of 69% on the training data (62% on the testing) when using an upsampling method. Downsampling yielded an accuracy of 51%. However, the model retained all features in the final model, indicating that it may not be the most effective way to select features for this model.
+
+As stated above, the PCA analysis provided no conclusive results as to most influential chemicals on the outcome. 
+
+Because of the very unbalanced nature of the outcome, the selected models performed poorly and were not very effective in predicting the outcome. When assesing the health effects of environmental exposures, it becomes important to look at effects of mixtures instead of specific chemicals. Our study does not do this further limiting the conclusions of this study. Therefore, the results of this study cannot be considered conclusive and more robust analyses are needed in order to decisively conclude the nature of the association between prenatal chemical exposure and low birthweight. 
+
+The data used in this project comes from the HELIX study which is a collaborative project across six established and ongoing longitudinal population-based birth cohort studies in six European countries. Overall, the study has a multilevel sample size of over 30,000 mother-child pairs. However, the subcohort of chemical and internal exposome (used in this project) has a sample of only 1,200 mother-child pairs. This might implicate ethical considerations about the generalizability of the findings in our project as well as the potential biases in the methods of data collection. A significant portion of the HELIX study data comes from questionnaires which may be self-reported and subject to bias and may not always accurately reflect the true values or behaviors being measured. 
+
+
+## References
+
+Guo, H., Jin, Y., Cheng, Y., Leaderer, B., Lin, S., Holford, T. R., Qiu, J., Zhang, Y., Shi, K., Zhu, Y., Niu, J., Bassig, B. A., Xu, S., Zhang, B., Li, Y., Hu, X., Chen, Q., & Zheng, T. (2014). Prenatal exposure to organochlorine pesticides and infant birth weight in China. Chemosphere, 110, 1–7. https://doi.org/10.1016/j.chemosphere.2014.02.017
+
+Jin, J. (2015). Babies With Low Birth Weight. JAMA, 313(4), 432. https://doi.org/10.1001/jama.2014.3698
+
+Padula, A. M., Monk, C., Brennan, P. A., Borders, A., Barrett, E. S., McEvoy, C., Foss, S., Desai, P., Alshawabkeh, A., Wurth, R., Salafia, C., Fichorova, R., Varshavsky, J., Kress, A., Woodruff, T. J., & Morello-Frosch, R. (2020). Maternal prenatal exposures to environmental chemicals and psychosocial stressors in the ECHO Program—Implications for research on perinatal outcomes. Journal of Perinatology : Official Journal of the California Perinatal Association, 40(1), 10–24. https://doi.org/10.1038/s41372-019-0510-y
